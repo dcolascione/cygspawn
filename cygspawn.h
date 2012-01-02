@@ -51,7 +51,6 @@ int posix_spawn_file_actions_addopen (
 
 /* *** spawnattr **** */
 
-
 #define POSIX_SPAWN_RESETIDS          (1<<0)
 #define POSIX_SPAWN_SETPGROUP         (1<<1)
 #define POSIX_SPAWN_SETSCHEDPARAM     (1<<2)
