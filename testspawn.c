@@ -13,7 +13,8 @@ int verbose=0;
 static void
 usage ()
 {
-  fprintf (stderr, "testspawn SHELL_REDIR* PROGRAM ARGS*: test posix_spawn\n");
+  fprintf (stderr,
+           "testspawn [-vg] SHELL_REDIR* PROGRAM ARGS*: test posix_spawn\n");
 }
 
 static int
@@ -131,6 +132,8 @@ main (int argc, char **argv)
   int status;
   posix_spawn_file_actions_t file_actions;
   posix_spawnattr_t attr;
+  short flags;
+  char *c;
   ++argv;
 
   if (posix_spawn_file_actions_init (&file_actions) < 0)
@@ -145,13 +148,35 @@ main (int argc, char **argv)
       return 127;
     }
 
-  /* Process directions given on command line.  Each redirection is in
-     bourne shell syntax.  */
+  if (posix_spawnattr_getflags (&attr, &flags) < 0)
+    {
+      perror ("posix_spawnattr_getflags");
+      return 127;
+    }
+
+  /* Process directions and options.  Each redirection is in bourne
+     shell syntax.  */
   for (; *argv; ++argv)
     {
-      if (!strcmp (*argv, "-v"))
+      if (**argv == '-')
         {
-          verbose = 1;
+          for (c = *argv + 1; *c; ++c)
+            switch (*c)
+              {
+              case 'v':
+                verbose = 1;
+                break;
+
+              case 'g':
+                flags |= POSIX_SPAWN_SETPGROUP;
+                break;
+
+              default:
+                fprintf (stderr, "testspawn: unknown flag '%c'\n", *c);
+                usage ();
+                return 127;
+              }
+
           continue;
         }
 
@@ -169,12 +194,16 @@ main (int argc, char **argv)
       return 127;
     }
 
+  if (posix_spawnattr_setflags (&attr, flags) < 0)
+    {
+      perror ("posix_spawnattr_setflags");
+      return 127;
+    }
+
   if (posix_spawnp (&child,
                     argv[0] /* path */,
-                    &file_actions,
-                    NULL /* attributes */,
-                    argv,
-                    NULL))
+                    &file_actions, &attr,
+                    argv, NULL))
     {
       perror ("posix_spawnp");
       return 127;
