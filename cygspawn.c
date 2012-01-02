@@ -532,8 +532,8 @@ cygspawn (
   int changed_sigmask = 0;
 
   int switched_ids = 0;
-  int orig_euid;
-  int orig_egid;
+  int orig_euid = 0;
+  int orig_egid = 0;
 
   const struct cygwin_spawn_ops *orig_so = NULL;
   struct cygwin_spawn_ops *shared_so = NULL;
