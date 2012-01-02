@@ -1,5 +1,10 @@
 /* Hacky non-forking posix_spawn implementation for Cygwin -*- c-file-style: "qgnu" -*- */
 #define _WIN32_WINNT 0x500
+#include <sys/param.h>
+
+#undef FD_SETSIZE
+#define FD_SETSIZE NOFILE
+
 #include <windows.h>
 #include <stdio.h>
 #include <errno.h>
@@ -501,7 +506,7 @@ cygspawn (
      appropriate token.  We can't call these functions in the child
      because NT doesn't allow a process token to change after
      creation, so we switch UID and GID in the parent, then switch
-     back after the spawn call. 
+     back after the spawn call.
 
      If another thread creates a process in window during which we've
      changed our eUIDs, its child will have the wrong credentials.  We
@@ -512,7 +517,7 @@ cygspawn (
      [1] Amazingly, execve and fork are async-signal-safe according to
      POSIX.
   */
-  
+
   HANDLE section = NULL;
   DWORD section_base_size;
   DWORD section_size;
@@ -529,7 +534,7 @@ cygspawn (
   int switched_ids = 0;
   int orig_euid;
   int orig_egid;
-  
+
   const struct cygwin_spawn_ops *orig_so = NULL;
   struct cygwin_spawn_ops *shared_so = NULL;
   struct cygwin_spawn_ops *rollback_so = NULL;
@@ -555,7 +560,7 @@ cygspawn (
 
   /* The child inherits a HANDLE pointing to a shared memory segment
      telling it what to do.  Create the segment.  */
-  
+
   section = CreateFileMapping (INVALID_HANDLE_VALUE /*pagefile*/,
                                &section_sa,
                                PAGE_READWRITE | SEC_COMMIT,
@@ -563,14 +568,16 @@ cygspawn (
 
   if (section == NULL)
     {
-      errno = ENOMEM;
+      errno = cygwin_internal (CW_GET_ERRNO_FROM_WINERROR,
+                               GetLastError (), ENOMEM);
       goto out;
     }
 
   shared_so = MapViewOfFile (section, FILE_MAP_WRITE, 0, 0, 0);
   if (shared_so == NULL)
     {
-      errno = ENOMEM;
+      errno = cygwin_internal (CW_GET_ERRNO_FROM_WINERROR,
+                               GetLastError (), ENOMEM);
       goto out;
     }
 
@@ -681,7 +688,7 @@ cygspawn (
 
   if (changed_sigmask)
     VERIFY (sigprocmask (SIG_SETMASK, &orig_sigmask, NULL) == 0);
-  
+
   if (section)
     VERIFY (CloseHandle (section));
 
@@ -800,7 +807,7 @@ init ()
       /* Remove only one instance of this module from LD_PRELOAD
          because our parent only added it once.  */
       remove_from_path_list (new_ld_preload, module_path, 1);
-      
+
       if (new_ld_preload[0])
         setenv ("LD_PRELOAD", new_ld_preload, 1);
       else
@@ -889,6 +896,7 @@ static struct spawn_fdop *
 alloc_fdop (struct cygwin_spawn_ops **sop)
 {
   struct cygwin_spawn_ops *so = *sop;
+
   if (so->nr == so->capacity)
     {
       unsigned newcap = so->capacity * 2;
@@ -909,8 +917,15 @@ posix_spawn_file_actions_addclose (
   posix_spawn_file_actions_t *file_actions,
   int filedes)
 {
-  struct spawn_fdop *op = alloc_fdop (file_actions);
-  if (!op)
+  struct spawn_fdop *op;
+
+  if (! (0 <= filedes && filedes < FD_SETSIZE))
+    {
+      errno = EBADF; /* posix */
+      return -1;
+    }
+
+  if ((op = alloc_fdop (file_actions)) == NULL)
     return -1;
 
   op->type = FDOP_CLOSE;
@@ -925,8 +940,16 @@ cygwin_spawn_file_actions_adddup3 (
   int newdes,
   int flags)
 {
-  struct spawn_fdop *op = alloc_fdop (file_actions);
-  if (!op)
+  struct spawn_fdop *op;
+
+  if (! (0 <= filedes && filedes < FD_SETSIZE) ||
+      ! (0 <= newdes && newdes < FD_SETSIZE)   )
+    {
+      errno = EBADF; /* POSIX */
+      return -1;
+    }
+
+  if (!(op = alloc_fdop (file_actions)))
     return -1;
 
   op->type = FDOP_DUP;
@@ -954,10 +977,16 @@ posix_spawn_file_actions_addopen (
   int oflag,
   mode_t mode)
 {
-  char *pathcopy = strdup (path);
+  char *pathcopy;
   struct spawn_fdop *op;
 
-  if (!pathcopy)
+  if (! (0 <= filedes && filedes < FD_SETSIZE))
+    {
+      errno = EBADF; /* posix */
+      return -1;
+    }
+
+  if (!(pathcopy = strdup (path)))
     return -1;
 
   op = alloc_fdop (file_actions);
