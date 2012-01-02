@@ -1,0 +1,41 @@
+cygwin project provides an efficient and POSIX-compliant "user-mode"
+implementation of posix_spawn [1] for Cygwin.  Using this facility
+improves process-creation performance considerably, especially for
+large processes:
+
+$ sh bench.sh
++ env ITER=1000 ./testspawn true
+
+    real    0m3.853s
+    user    0m1.242s
+    sys     0m2.321s
+    + env ITER=1000 ./testfork true
+
+    real    0m8.658s
+    user    0m3.329s
+    sys     0m4.582s
+    + env ITER=1000 JUNKBYTES=209715200 ./testspawn true
+
+    real    0m3.916s
+    user    0m1.213s
+    sys     0m2.393s
+    + env ITER=1000 JUNKBYTES=209715200 ./testfork true
+
+    real    1m59.643s
+    user    0m3.318s
+    sys     1m55.062s
+
+All posix_spawn functionality is supported, and no special
+configuration is required.  This library must be dynamically linked
+into any program using POSIX spawn.
+
+To install:
+
+    make
+    make install prefix=/usr
+
+To build programs with posix_spawn:
+
+    gcc -o foo foo.c -lcygspawn
+
+[1] http://pubs.opengroup.org/onlinepubs/009695399/functions/posix_spawn.html
