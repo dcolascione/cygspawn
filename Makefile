@@ -23,4 +23,4 @@ $(DLLNAME) $(IMPLIBNAME): cygspawn.o
 	    -Wl,--no-whole-archive $+
 
 clean:
-	rm -f *.dll *.a *.o *.exe
+	rm -f *.dll *.a *.o *.exe *.stackdump
