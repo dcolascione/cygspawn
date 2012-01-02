@@ -18,14 +18,19 @@ CFLAGS+= -DNDEBUG -Wno-unused-value
 override CFLAGS+=-std=gnu99
 
 .PHONY: all
-all: $(DLLNAME) $(IMPLIBNAME) listvma testspawn
+all: $(DLLNAME) $(IMPLIBNAME) listvma testspawn.exe testfork.exe
 
 cygspawn.o: cygspawn.c cygspawn.h
 
 listvma: LDLIBS+=-lpsapi
 listvma: listvma.o
 
-testspawn: $(IMPLIBNAME)
+testspawn.exe: testspawn.c $(IMPLIBNAME)
+	$(CC) $(CFLAGS) -o $@ $+ $(LDFLAGS) $(LDLIBS)
+
+testfork.exe: override CFLAGS+=-DUSE_FORK
+testfork.exe: testspawn.c
+	$(CC) $(CFLAGS) -o $@ $+ $(LDLIBS)
 
 $(DLLNAME) $(IMPLIBNAME): cygspawn.o cygspawn.def
 	gcc -shared -o $(DLLNAME) $(CFLAGS) \
