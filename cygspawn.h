@@ -4,6 +4,10 @@
 #include <signal.h>
 #include <sched.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* **** spawn ****  */
 
 typedef struct cygwin_spawn_ops *posix_spawn_file_actions_t;
@@ -112,5 +116,9 @@ int posix_spawnattr_getsigmask (
 int posix_spawnattr_setsigmask (
   posix_spawnattr_t *restrict attr,
   const sigset_t *restrict sigmask);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* CYGSPAWN_H */
