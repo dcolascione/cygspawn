@@ -3,27 +3,28 @@ implementation of posix_spawn [1] for Cygwin.  Using this facility
 improves process-creation performance considerably, especially for
 large processes:
 
-$ sh bench.sh
-+ env ITER=1000 ./testspawn true
+    ~/cygspawn
+    $ sh bench.sh
+    + env ITER=1000 ./testspawn true
 
-    real    0m3.853s
-    user    0m1.242s
-    sys     0m2.321s
+    real    0m4.508s
+    user    0m1.275s
+    sys     0m2.675s
     + env ITER=1000 ./testfork true
 
-    real    0m8.658s
-    user    0m3.329s
-    sys     0m4.582s
+    real    0m8.845s
+    user    0m2.847s
+    sys     0m5.230s
     + env ITER=1000 JUNKBYTES=209715200 ./testspawn true
 
-    real    0m3.916s
-    user    0m1.213s
-    sys     0m2.393s
+    real    0m5.179s
+    user    0m1.550s
+    sys     0m2.661s
     + env ITER=1000 JUNKBYTES=209715200 ./testfork true
 
-    real    1m59.643s
-    user    0m3.318s
-    sys     1m55.062s
+    real    1m57.523s
+    user    0m3.049s
+    sys     1m52.339s
 
 All posix_spawn functionality is supported, and no special
 configuration is required.  This library must be dynamically linked
