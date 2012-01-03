@@ -14,7 +14,8 @@ INSTALL_PROGRAM=$(INSTALL) -s
 INSTALL_DATA=$(INSTALL) -m 0644
 
 CFLAGS=-Os -Wall -g -Werror
-CFLAGS+= -DNDEBUG -Wno-unused-value
+CFLAGS+= -DNDEBUG
+CFLAGS+=-Wno-unused-value
 override CFLAGS+=-std=gnu99
 
 .PHONY: all
