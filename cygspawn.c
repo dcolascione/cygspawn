@@ -14,6 +14,7 @@
 #include <process.h>
 #include <assert.h>
 #include <sys/cygwin.h>
+#include <sys/mman.h>
 #include "cygspawn.h"
 
 /* VERIFY(x) is like assert, except that in NDEBUG builds, VERIFY
@@ -71,6 +72,8 @@ struct cygwin_spawn_ops
   struct cygwin_spawn_info info;
   unsigned nr;
   unsigned capacity;
+  unsigned use_execvpe : 1;
+  char *args; /* Relative to struct base.  */
   struct spawn_fdop ops[];
 };
 
@@ -224,8 +227,8 @@ prepare_ops (
   return ret;
 }
 
-/* Count how many bytes are used by strings in SO, including null
-   terminators.  */
+/* Count how many additional bytes are needed to encode the pointed-to
+   information in so.  */
 static size_t
 sum_string_sizes (const struct cygwin_spawn_ops *so)
 {
@@ -345,7 +348,8 @@ static int
 copy_strvec (
   const char *const *vec,
   char ***out,
-  size_t extra)
+  size_t extra_before,
+  size_t extra_after)
 {
   size_t nr;
   char **newvec = NULL;
@@ -354,11 +358,12 @@ copy_strvec (
   for (pos = vec; *pos; ++pos)
     ++nr;
 
-  newvec = malloc (sizeof (*newvec) * (nr + extra + 1));
+  newvec = malloc (sizeof (*newvec) *
+                   (nr + extra_before + extra_after + 1));
   if (!newvec)
     return -1;
 
-  memcpy (newvec, vec, sizeof (*newvec) * (nr + 1));
+  memcpy (newvec + extra_before, vec, sizeof (*newvec) * (nr + 1));
   *out = &newvec[0];
   return 0;
 }
@@ -422,7 +427,7 @@ prepend_preload (const char *module,
 }
 
 static int
-run_ops (const struct cygwin_spawn_ops *so)
+run_ops (const struct cygwin_spawn_ops *so, int fd_flag_mask)
 {
   unsigned i;
   for (i = 0; i < so->nr; ++i)
@@ -430,11 +435,12 @@ run_ops (const struct cygwin_spawn_ops *so)
       const struct spawn_fdop *op = &so->ops[i];
       if (op->type == FDOP_OPEN)
         {
-          int opened = open (op->open.path,
-                             op->open.oflag,
-                             op->open.mode);
+          int opened;
+          int oflag = op->open.oflag;
+          if (fd_flag_mask & FD_CLOEXEC)
+            oflag &= ~O_CLOEXEC;
 
-          if (opened < 0)
+          if ((opened = open (op->open.path, oflag, op->open.mode)) < 0)
             return -1;
 
           if (opened != op->open.filedes)
@@ -459,15 +465,14 @@ run_ops (const struct cygwin_spawn_ops *so)
         }
       else if (op->type == FDOP_DUP)
         {
+          int flags = op->dup.flags & fd_flag_mask;
           if (op->dup.filedes == op->dup.newdes)
             {
-              if (fcntl (op->dup.filedes,
-                         F_SETFD, op->dup.flags) < 0)
+              if (fcntl (op->dup.filedes, F_SETFD, flags) < 0)
                 return -1;
             }
           else
-            if (dup3 (op->dup.filedes, op->dup.newdes,
-                      op->dup.flags) < 0)
+            if (dup3 (op->dup.filedes, op->dup.newdes, flags) < 0)
               return -1;
         }
       else if (op->type == FDOP_CLOSE)
@@ -487,19 +492,256 @@ run_ops (const struct cygwin_spawn_ops *so)
 }
 
 static int
+search_path (const char *path, const char *base,
+             int *exefd_out, char **name_out)
+{
+  char *candidate = NULL;
+  size_t name_length = 0;
+  int exefd;
+  size_t component_length;
+  const char *component;
+  size_t base_length = strlen (base);
+
+  while (*path)
+    {
+      component = path;
+      component_length = strcspn(component, ":");
+      path += component_length;
+      if (*path) ++path;
+
+      if (component_length == 0)
+        {
+          /* An empty path component means the current directory.  */
+          component = ".";
+          component_length = 1;
+        }
+
+      if (name_length < base_length + component_length + 2)
+        {
+          char *new_candidate;
+          name_length = base_length + component_length + 2;
+          if (!(new_candidate = realloc (candidate, name_length)))
+            goto err;
+          candidate = new_candidate;
+        }
+
+      {
+        char *name_pos = candidate;
+        memcpy (name_pos, component, component_length);
+        name_pos += component_length;
+        *name_pos = '/';
+        name_pos += 1;
+        memcpy (name_pos, base, base_length);
+        name_pos += base_length;
+        *name_pos = '\0';
+      }
+
+      if ((exefd = open (candidate, O_RDONLY | O_CLOEXEC)) >= 0)
+        break;
+    }
+
+  if (exefd == -1)
+    {
+      errno = ENOENT;
+      goto err;
+    }
+
+  *name_out = candidate;
+  *exefd_out = exefd;
+  return 0;
+
+ err:
+  free (candidate);
+  return -1;
+}
+
+static int
+is_cygwin_executable (int opt_exefd, const char *exepath)
+{
+  int ret = -1;
+  int exefd = opt_exefd;
+  char *img;
+  off_t imgsz;
+  IMAGE_DOS_HEADER *dh;
+  IMAGE_NT_HEADERS32 *nth;
+  IMAGE_OPTIONAL_HEADER32 *opt;
+  IMAGE_IMPORT_DESCRIPTOR *import;
+
+  if (exefd == -1 &&
+      (exefd = open (exepath, O_RDONLY | O_CLOEXEC)) < 0)
+    goto out;
+
+  imgsz = lseek (exefd, 0, SEEK_END);
+  if (imgsz == (off_t) -1)
+    goto out;
+
+  if (imgsz > (size_t) -1) imgsz = (size_t) -1;
+  if ((img = mmap (NULL, (size_t) imgsz,
+                   PROT_READ, MAP_PRIVATE, exefd, 0)) == NULL)
+    goto out;
+
+#define C(pred) ({if (!(pred)) { ret = 0; goto out; }})
+#define V(sptr, sz)                                                     \
+  C (img <= (char *) (sptr) && (char *) (sptr) + (sz) <= img + imgsz)
+#define A(rva) ({                                                       \
+      char *x = (char *) (rva);                                         \
+      char *sb = NULL;                                                  \
+      IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION (nth);              \
+      IMAGE_SECTION_HEADER *se = s + nth->FileHeader.NumberOfSections;  \
+      for (; s < se; ++s)                                               \
+        {                                                               \
+          V (s, sizeof (*s));                                           \
+          sb = (char *) s->VirtualAddress;                              \
+          if ( sb <= x && x < sb + s->Misc.VirtualSize)                 \
+            break;                                                      \
+        }                                                               \
+                                                                        \
+      C (s != se);                                                      \
+      (void *)(img + s->PointerToRawData + (x - sb));                   \
+    })
+
+  if (imgsz >= 2 && img[0] == '#' && img[1] == '!')
+    {
+      ret = 1;
+      goto out;
+    }
+
+  dh = (void *) img;
+  V (dh, sizeof (*dh));
+  C (dh->e_magic == IMAGE_DOS_SIGNATURE);
+  nth = (void *) (img + dh->e_lfanew);
+  V (nth, sizeof (*nth));
+
+  C (nth->Signature == IMAGE_NT_SIGNATURE);
+  C (nth->FileHeader.Machine == IMAGE_FILE_MACHINE_I386);
+  opt = &nth->OptionalHeader;
+
+  C (opt->Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC);
+  C (opt->Subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI);
+
+  import = A (opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+              .VirtualAddress);
+
+  for (;; ++import)
+    {
+      char *name;
+      char *name_end;
+
+      V (import, sizeof (*import));
+      if (import->Name == 0)
+        break;
+
+      name = name_end = A (import->Name);
+      do
+        V (name_end, 1);
+      while (*name_end++);
+
+      if (!strcmp (name, "cygwin1.dll"))
+        {
+          ret = 1;
+          goto out;
+        }
+    }
+
+#undef A
+#undef V
+#undef C
+
+  ret = 0;
+
+ out:
+
+  if (ret == -1 && errno == ENODATA)
+      ret = 0; /* Ran off end of file */
+
+  if (img)
+    VERIFY (munmap (img, imgsz) == 0);
+
+  if (exefd != -1 && exefd != opt_exefd)
+    VERIFY (close (exefd) == 0);
+
+  return ret;
+}
+
+static void
+encode_strvec (const char *prgname,
+               char *const restrict *restrict argv,
+               char *out,
+               size_t *bytes_out)
+{
+  const char *item;
+  char *start = out;
+
+#define OUTC(c) ({ char t = (c); if (start) *out = t; ++out; })
+
+  item = prgname;
+  do
+    {
+      if (*item == '\0') OUTC ('!');
+      if (*item == '!' ) OUTC ('!');
+
+      do
+        OUTC (*item++);
+      while (item[-1]);
+
+      item = *argv++;
+    }
+  while (item);
+
+  if (bytes_out)
+    *bytes_out = (out - start);
+
+#undef OUTC
+}
+
+/* Build an array of pointers to strings.  Each element in the array
+   points to a string in the doubly-null-terminated list of strings
+   BUF.  Store the array, which must be freed, into *VEC_OUT.  */
+static int
+decode_strvec (const char *buf, const char ***vec_out)
+{
+  size_t nrstr;
+  size_t i;
+  const char *pos;
+  const char **vec;
+
+  pos = buf;
+  while (*pos)
+    {
+      ++nrstr;
+      pos += strlen (pos) + 1;
+    }
+
+  vec = malloc (sizeof (*vec) * (nrstr + 1));
+  if (!vec)
+    return -1;
+
+  for (i = 0, pos = buf; *pos; ++i, pos += strlen (pos) + 1)
+    {
+      vec[i] = pos;
+      if (vec[i][0] == '!') vec[i] += 1;
+    }
+
+  vec[i] = NULL;
+  *vec_out = vec;
+  return 0;
+}
+
+static int
 cygspawn (
-  int use_spawnp,
+  int exefd,
+  const char *restrict exepath,
+  int use_spawnvpe,
   pid_t *restrict pid,
-  const char *restrict path,
   const posix_spawn_file_actions_t *file_actions,
   const posix_spawnattr_t *restrict attrp,
-  char *const restrict argv[restrict],
-  char *const restrict envp[restrict])
+  char *const restrict *restrict argv,
+  char *const restrict *restrict envp)
 {
   /* N.B. This code is slightly racy because we temporary turn off
-     O_CLOEXEC on some file descriptors, so if another thread creates
-     a process, it might unintentionally cause some files to be
-     inherited there.
+     O_CLOEXEC on some file descriptors in order to allow them to be
+     inherited across exec.  If another thread creates a process, it
+     might unintentionally cause some files to be inherited there.
 
      We also race if POSIX_SPAWN_RESETIDS is used: we use seteuid and
      setegid in the parent so that the child starts with the
@@ -520,6 +762,7 @@ cygspawn (
 
   HANDLE section = NULL;
   DWORD section_base_size;
+  size_t argv_extra = 0;
   DWORD section_size;
   SECURITY_ATTRIBUTES section_sa =
       { sizeof (section_sa), NULL /* descriptor */, TRUE /* inherit */};
@@ -543,6 +786,16 @@ cygspawn (
   char *ld_preload = NULL;
   char **new_envp = NULL;
 
+  if (!is_cygwin_executable (exefd, exepath))
+    {
+      /* It looks like we're about to run a non-Cygwin program, run
+         /bin/false first as a minimal LD_PRELOAD host.  The
+         LD_PRELOAD code there execs the caller's program.  (We can't
+         just use /usr/bin/env because we need to be able to set
+         argv[0] separately from the program name.)  */
+      encode_strvec (exepath, argv, NULL, &argv_extra);
+    }
+
   if (file_actions)
     orig_so = *file_actions;
 
@@ -564,7 +817,8 @@ cygspawn (
   section = CreateFileMapping (INVALID_HANDLE_VALUE /*pagefile*/,
                                &section_sa,
                                PAGE_READWRITE | SEC_COMMIT,
-                               0, section_size, NULL /*anonymous*/);
+                               0, section_size + argv_extra,
+                               NULL /*anonymous*/);
 
   if (section == NULL)
     {
@@ -612,7 +866,7 @@ cygspawn (
   if (!envp)
     envp = environ;
 
-  if (copy_strvec ((const char *const *)envp, &new_envp, 2) < 0)
+  if (copy_strvec ((const char *const *)envp, &new_envp, 0, 2) < 0)
     goto out;
 
   /* Tell the child where to find more information.  */
@@ -633,10 +887,6 @@ cygspawn (
                                /* see race comment above */
                                POSIX_SPAWN_RESETIDS  ))
     {
-      /* By blocking all signals, we eliminate a race that would allow
-         a child to receive a signal before our LD_PRELOAD code runs
-         and handle it the wrong way.  */
-
       if (sigfillset (&all_signals) < 0)
         goto out;
 
@@ -661,14 +911,20 @@ cygspawn (
       switched_ids = 1;
     }
 
-  if (use_spawnp)
-    ret = spawnvpe (_P_NOWAIT, path,
-                    (const char * const *) argv,
-                    (const char * const *) new_envp);
+  if (argv_extra)
+    {
+      char *buf = (char *) shared_so + section_size;
+      shared_so->args = (buf - (ptrdiff_t) shared_so);
+      shared_so->use_execvpe = use_spawnvpe;
+
+      encode_strvec (exepath, argv, buf, NULL);
+      ret = spawnle (_P_NOWAIT, "/bin/false", "false", NULL, new_envp);
+    }
   else
-    ret = spawnve (_P_NOWAIT, path,
-                   (const char * const *) argv,
-                   (const char * const *) new_envp);
+    ret = (use_spawnvpe ? spawnvpe : spawnve) (
+      _P_NOWAIT, exepath,
+      (const char * const *) argv,
+      (const char * const *) new_envp);
 
   if (ret < 0)
     goto out;
@@ -697,10 +953,11 @@ cygspawn (
 
   if (rollback_so)
     {
-      VERIFY (run_ops (rollback_so) == 0);
+      VERIFY (run_ops (rollback_so, 0) == 0);
       VERIFY (posix_spawn_file_actions_destroy (&rollback_so) == 0);
     }
 
+  close (exefd);
   free (new_envp);
   free (ld_preload);
   free (module_path);
@@ -821,15 +1078,35 @@ init ()
   if (so == NULL)
     _exit (127);
 
+  VERIFY (CloseHandle (section));
   rewrite_strings (so, NULL, (ptrdiff_t) so);
 
-  /* Do what our parent told us to do.  */
-  if (apply_spawn_info (&so->info) < 0 || run_ops (so) < 0)
+  /* Do what our parent told us to do.  If we're about to exec again,
+     turn off FD_CLOEXEC on file descriptors we make so that the
+     non-Cygwin child will inherit them.  */
+  if (apply_spawn_info (&so->info) < 0 ||
+      run_ops (so, so->args ? FD_CLOEXEC : 0) < 0)
     _exit (127); /* Exit code specified by POSIX. */
+
+  if (so->args)
+    {
+      /* Parent told us to exec.  args below points to a
+         doubly-null-terminated list.  The first element is the
+         program to execute; the rest form argv.  */
+      const char ** exec_args;
+      if (decode_strvec (so->args + (ptrdiff_t) so, &exec_args) < 0)
+        _exit (127);
+
+      if (so->use_execvpe)
+        execvpe (exec_args[0], (char *const *) exec_args + 1, NULL);
+      else
+        execve (exec_args[0],  (char *const *) exec_args + 1, NULL);
+
+      _exit (127);
+    }
 
   free (module_path);
   free (new_ld_preload);
-  VERIFY (CloseHandle (section));
   VERIFY (UnmapViewOfFile (so));
 }
 
@@ -842,7 +1119,7 @@ posix_spawn (
   char *const restrict argv[restrict],
   char *const restrict envp[restrict])
 {
-  return cygspawn (0, pid, path, file_actions, attrp, argv, envp);
+  return cygspawn (-1, path, 0, pid, file_actions, attrp, argv, envp);
 }
 
 int
@@ -854,7 +1131,30 @@ posix_spawnp (
   char *const restrict argv[restrict],
   char *const restrict envp[restrict])
 {
-  return cygspawn (1, pid, path, file_actions, attrp, argv, envp);
+  int ret;
+  int exefd;
+  char *exepath;
+  char *is_absolute = strchr (path, '/');
+
+  if (is_absolute)
+    {
+      exepath = (char *) path;
+      exefd = -1;
+    }
+  else
+    if (search_path ((getenv ("PATH") ?: "/bin:/usr/bin"),
+                     path, &exefd, &exepath) < 0)
+      return -1;
+
+  ret = cygspawn (exefd, exepath, 1, pid, file_actions, attrp, argv, envp);
+
+  if (exefd != -1)
+    VERIFY (close (exefd));
+
+  if (!is_absolute)
+    free (exepath);
+
+  return ret;
 }
 
 int
